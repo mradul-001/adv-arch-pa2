@@ -30,9 +30,13 @@ __pycache__/
 *.pyc
 .venv/
 scripts/
-# drafts (content goes into Summary.pdf) and tuning-run logs
 report/
 results/**/*.log
-# keep only the final-design sensitivity runs (r2_*); round-1 used the old 32-entry IPT
 results/task1/tuning/*
 !results/task1/tuning/r2_*
+.vscode/
+.idea/
+*.swp
+*~
+.DS_Store
+.claude/

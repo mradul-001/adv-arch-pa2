@@ -1,15 +1,16 @@
 #include "cache.h"
 
-// SPP: per-IP uniform stride detection, falling back to a signature-indexed
-// Pattern Table for non-uniform repeating strides. Degree throttled by accuracy.
+// SPP: per-IP stride prefetcher. If an IP has a constant stride we prefetch
+// with that, otherwise we use a signature of its recent strides to look up
+// the next stride in a pattern table. Degree is set from prefetch accuracy.
 
 #define SPP_IPT_ENTRIES      64
 #define SPP_IP_TAG_BITS      10
 #define SPP_LINE_BITS        16
 #define SPP_STRIDE_BITS      7
-#define SPP_STRIDE_MAX       63      // a page has 64 lines
+#define SPP_STRIDE_MAX       63      // 64 lines in a 4KB page
 #define SPP_UCONF_MAX        3
-#define SPP_UCONF_THRESH     3       // saturated: keeps (2,2,2) inside a pattern from looking uniform
+#define SPP_UCONF_THRESH     3       // with 2, the 2,2,2 inside 1,2,2,2,3 looked uniform
 
 #define SPP_SIG_BITS         12
 #define SPP_SIG_MASK         ((1 << SPP_SIG_BITS) - 1)
@@ -19,23 +20,23 @@
 #define SPP_PCONF_MAX        3
 #define SPP_PCONF_THRESH     2
 
-#define SPP_EPOCH_PF         256
+#define SPP_EPOCH_PF         256     // check accuracy every 256 prefetches
 #define SPP_DEGREE_INIT      2
 #define SPP_ACC_HIGH         75
 #define SPP_ACC_MID          50
 #define SPP_ACC_LOW          25
-#define SPP_DEG_HIGH         4       // accuracy >= HIGH
-#define SPP_DEG_MID          3       // accuracy >= MID
-#define SPP_DEG_LOW          2       // accuracy >= LOW
-#define SPP_DEG_MIN          1       // otherwise
+#define SPP_DEG_HIGH         4
+#define SPP_DEG_MID          3
+#define SPP_DEG_LOW          2
+#define SPP_DEG_MIN          1
 #define SPP_DEGREE_MAX       SPP_DEG_HIGH
 
-#define SPP_FILL_L1_ALWAYS   0       // 0: fill L2 only when L1D MSHR is over half full
+#define SPP_FILL_L1_ALWAYS   0       // 0: fill only L2 if L1D MSHR is more than half full
 
 struct SPP_IPT_ENTRY {
     bool     valid;
     uint16_t ip_tag;
-    uint16_t last_line;
+    uint16_t last_line;    // only low 16 bits
     int8_t   last_stride;
     uint8_t  uconf;
     uint16_t sig;
@@ -51,8 +52,8 @@ SPP_IPT_ENTRY spp_ipt[SPP_IPT_ENTRIES];
 SPP_PT_ENTRY  spp_pt[SPP_PT_ENTRIES];
 
 uint32_t spp_degree = SPP_DEGREE_INIT;
-// Accuracy uses pf_lower_level (as ChampSim's ACCURACY), not pf_issued,
-// which also counts prefetches that hit in L1D.
+// using pf_lower_level and not pf_issued, since pf_issued also counts
+// prefetches that hit in L1D (same as how champsim computes ACCURACY)
 uint64_t spp_epoch_issued_base = 0;
 uint64_t spp_epoch_useful_base = 0;
 
@@ -74,7 +75,7 @@ static inline uint16_t spp_sig_next(uint16_t sig, int stride)
     return ((sig << SPP_SIG_SHIFT) ^ (stride & ((1 << SPP_STRIDE_BITS) - 1))) & SPP_SIG_MASK;
 }
 
-// Stride from only the stored low bits; valid while |stride| < 2^(SPP_LINE_BITS-1).
+// works with just the low 16 bits since strides we care about are small
 static inline int spp_stride(uint64_t cl_addr, uint16_t last_line)
 {
     return (int16_t)((uint16_t)cl_addr - last_line);
@@ -88,7 +89,7 @@ static void spp_lru_touch(uint32_t idx)
     spp_ipt[idx].lru = 0;
 }
 
-// Returns the entry for tag; on a miss, resets the LRU victim and sets hit = false.
+// on a miss, replaces the LRU entry and sets hit = false
 static uint32_t spp_ipt_lookup(uint16_t tag, bool &hit)
 {
     for (uint32_t i = 0; i < SPP_IPT_ENTRIES; i++)
@@ -113,7 +114,7 @@ static uint32_t spp_ipt_lookup(uint16_t tag, bool &hit)
     return victim;
 }
 
-// Hysteresis: a different stride replaces the prediction only once confidence drains to 0.
+// stride is replaced only after confidence drops to 0, so one odd stride doesn't kill a good entry
 static void spp_pt_train(uint16_t sig, int stride)
 {
     SPP_PT_ENTRY &p = spp_pt[spp_pt_index(sig)];
@@ -151,7 +152,7 @@ void CACHE::l1d_prefetcher_initialize()
     std::cout << "        Stride Pattern Prefetcher (SPP)         " << std::endl;
     std::cout << "------------------------------------------------" << std::endl;
 
-    // LRU victim search needs distinct ranks 0..N-1.
+    // lru ranks must start as 0..63
     for (uint32_t i = 0; i < SPP_IPT_ENTRIES; i++) {
         spp_ipt[i] = SPP_IPT_ENTRY();
         spp_ipt[i].lru = i;
@@ -162,7 +163,7 @@ void CACHE::l1d_prefetcher_initialize()
 
 void CACHE::l1d_prefetcher_operate(uint64_t addr, uint64_t ip, uint8_t cache_hit, uint8_t type, uint8_t critical_ip_flag)
 {
-    // Also called for PREFETCH packets; train on demand accesses only.
+    // train only on demand accesses
     if (type != LOAD && type != RFO)
         return;
 
@@ -187,6 +188,7 @@ void CACHE::l1d_prefetcher_operate(uint64_t addr, uint64_t ip, uint8_t cache_hit
         return;
     e.last_line = (uint16_t)cl_addr;
 
+    // jumped to a far region, start over
     if (stride > SPP_STRIDE_MAX || stride < -SPP_STRIDE_MAX) {
         e.last_stride = 0;
         e.uconf = 0;
@@ -194,7 +196,6 @@ void CACHE::l1d_prefetcher_operate(uint64_t addr, uint64_t ip, uint8_t cache_hit
         return;
     }
 
-    // Train: uniform confidence resets on any change; PT learns sig -> stride.
     if (stride == e.last_stride) {
         if (e.uconf < SPP_UCONF_MAX)
             e.uconf++;
@@ -205,6 +206,7 @@ void CACHE::l1d_prefetcher_operate(uint64_t addr, uint64_t ip, uint8_t cache_hit
     spp_pt_train(e.sig, stride);
     e.sig = spp_sig_next(e.sig, stride);
 
+    // returns false if the line is outside the current page
     auto issue = [&](uint64_t pf_line) -> bool {
         uint64_t pf_addr = pf_line << LOG2_BLOCK_SIZE;
         if ((pf_addr >> LOG2_PAGE_SIZE) != page)
@@ -221,7 +223,7 @@ void CACHE::l1d_prefetcher_operate(uint64_t addr, uint64_t ip, uint8_t cache_hit
             spp_stat_uniform++;
         }
     } else {
-        // Walk the PT along a speculative signature: one predicted stride per step.
+        // follow the pattern table ahead using a speculative signature
         uint16_t sig = e.sig;
         uint64_t line = cl_addr;
         for (uint32_t k = 0; k < spp_degree; k++) {
